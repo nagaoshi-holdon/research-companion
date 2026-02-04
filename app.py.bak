@@ -1,0 +1,1800 @@
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timedelta, date, time as dtime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import streamlit as st
+
+# Optional (timer smoothness). App works without it.
+try:
+    from streamlit_autorefresh import st_autorefresh  # type: ignore
+except Exception:
+    st_autorefresh = None  # type: ignore
+
+
+# =========================================================
+# Constants / Config
+# =========================================================
+
+APP_TITLE = "Research Companion (Monitor)"
+DATA_DIR = Path("data")
+DAYS_DIR = DATA_DIR / "days"
+GOALS_PATH = DATA_DIR / "goals.json"
+
+# "Research day" boundary to avoid confusion with midnight work.
+# Example: 04:00 means tasks after 00:00 and before 04:00 still belong to "yesterday".
+DEFAULT_DAY_ROLLOVER_HOUR = 4
+
+# Categories (coarse granularity)
+CATEGORIES = [
+    "先行研究",
+    "実験準備",
+    "実験",
+    "分析",
+    "データまとめ",
+    "執筆",
+    "その他",
+]
+
+# Suggestion templates (editable)
+DEFAULT_SUGGESTIONS = [
+    "先行研究を1本だけ読んで、要点を3行で残す",
+    "分析の図を1枚だけ作る（軸と凡例だけでもOK）",
+    "本文を200字だけ進める（書けるところから）",
+]
+
+# Feature flags (billing is disabled for monitor testing)
+FEATURE_FLAGS = {
+    "billing": False,
+    "monitor_report": True,
+}
+
+# =========================================================
+# Utility: filesystem / JSON
+# =========================================================
+
+
+def ensure_dirs() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    DAYS_DIR.mkdir(exist_ok=True)
+
+
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        if not path.exists():
+            return default
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+
+def now_local() -> datetime:
+    # Streamlit runs on local machine, so local time is fine.
+    return datetime.now()
+
+
+def parse_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def fmt_date(d: date) -> str:
+    return d.strftime("%Y-%m-%d")
+
+
+def today_research_date(rollover_hour: int) -> date:
+    n = now_local()
+    if n.hour < rollover_hour:
+        return (n.date() - timedelta(days=1))
+    return n.date()
+
+
+def day_path(d: date) -> Path:
+    return DAYS_DIR / f"{fmt_date(d)}.json"
+
+
+# =========================================================
+# Data model for Days (keep additive / backwards-friendly)
+# =========================================================
+
+# Day schema (additive fields only; keep minimal):
+# {
+#   "date": "YYYY-MM-DD",
+#   "created_at": "...",
+#   "plan": {...},       # optional
+#   "tasks": [ {task} ],
+#   "closed": bool,
+#   "closed_at": "...",
+#   "reflection": {...}, # optional
+# }
+#
+# task:
+# {
+#   "id": "...",
+#   "short": "やること（短く）",
+#   "category": "...",
+#   "est_min": 60,
+#   "status": "todo|doing|paused|done|cut",
+#   "time": { "sessions": [ {start,end,duration_sec} ], "total_sec": 0 },
+#   "ended_early": { ... }  # optional
+#   "done_note": "...",     # optional
+#   "goal_id": "...",       # optional link
+#   "milestone_id": "...",  # optional link
+# }
+
+
+def load_day(d: date) -> Dict[str, Any]:
+    ensure_dirs()
+    p = day_path(d)
+    day = read_json(p, default={})
+    if not day:
+        day = {
+            "date": fmt_date(d),
+            "created_at": now_local().isoformat(timespec="seconds"),
+            "tasks": [],
+            "closed": False,
+        }
+        atomic_write_json(p, day)
+
+    # Normalize fields (backward-friendly)
+    day.setdefault("date", fmt_date(d))
+    day.setdefault("tasks", [])
+    day.setdefault("closed", False)
+    return day
+
+
+def save_day(day: Dict[str, Any]) -> None:
+    d = parse_date(day["date"])
+    atomic_write_json(day_path(d), day)
+
+
+def ensure_task_shape(task: Dict[str, Any]) -> Dict[str, Any]:
+    task.setdefault("id", str(uuid.uuid4()))
+    task.setdefault("short", "")
+    task.setdefault("category", "その他")
+    task.setdefault("est_min", 25)
+    task.setdefault("status", "todo")
+    task.setdefault("time", {"sessions": [], "total_sec": 0})
+    task.setdefault("done_note", "")
+    # Optional:
+    # goal_id, milestone_id, ended_early
+    return task
+
+
+def find_task(day: Dict[str, Any], task_id: str) -> Optional[Dict[str, Any]]:
+    for t in day.get("tasks", []):
+        if t.get("id") == task_id:
+            return t
+    return None
+
+
+def update_task(day: Dict[str, Any], updated: Dict[str, Any]) -> None:
+    tasks = day.get("tasks", [])
+    for i, t in enumerate(tasks):
+        if t.get("id") == updated.get("id"):
+            tasks[i] = updated
+            day["tasks"] = tasks
+            return
+    tasks.append(updated)
+    day["tasks"] = tasks
+
+
+# =========================================================
+# Goals / Milestones (separate file to avoid breaking day logs)
+# =========================================================
+
+# goals.json schema:
+# {
+#   "goals": [
+#     {
+#       "id":"...",
+#       "title":"...",
+#       "due_date":"YYYY-MM-DD",
+#       "deliverable":"(required)",
+#       "created_at":"...",
+#       "archived":false,
+#       "milestones":[
+#         {"id":"...","title":"...","due_date":"YYYY-MM-DD","deliverable":"...","status":"todo|doing|done"}
+#       ]
+#     }
+#   ]
+# }
+
+DEFAULT_GOALS = {"goals": []}
+
+
+def load_goals() -> Dict[str, Any]:
+    ensure_dirs()
+    data = read_json(GOALS_PATH, DEFAULT_GOALS)
+    if not isinstance(data, dict):
+        data = DEFAULT_GOALS
+    data.setdefault("goals", [])
+    # Normalize
+    for g in data["goals"]:
+        g.setdefault("id", str(uuid.uuid4()))
+        g.setdefault("title", "")
+        g.setdefault("due_date", fmt_date(today_research_date(DEFAULT_DAY_ROLLOVER_HOUR)))
+        g.setdefault("deliverable", "")
+        g.setdefault("created_at", now_local().isoformat(timespec="seconds"))
+        g.setdefault("archived", False)
+        g.setdefault("milestones", [])
+        for m in g["milestones"]:
+            m.setdefault("id", str(uuid.uuid4()))
+            m.setdefault("title", "")
+            m.setdefault("due_date", g.get("due_date", fmt_date(today_research_date(DEFAULT_DAY_ROLLOVER_HOUR))))
+            m.setdefault("deliverable", "")
+            m.setdefault("status", "todo")
+    return data
+
+
+def save_goals(data: Dict[str, Any]) -> None:
+    atomic_write_json(GOALS_PATH, data)
+
+
+def goal_lookup(goals_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return {g["id"]: g for g in goals_data.get("goals", [])}
+
+
+def milestone_lookup(goals_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for g in goals_data.get("goals", []):
+        for m in g.get("milestones", []):
+            out[m["id"]] = m
+    return out
+
+
+def next_upcoming_milestone(goals_data: Dict[str, Any], ref: date) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    # Returns (goal, milestone) for nearest due unfinished milestone
+    candidates: List[Tuple[date, Dict[str, Any], Dict[str, Any]]] = []
+    for g in goals_data.get("goals", []):
+        if g.get("archived"):
+            continue
+        for m in g.get("milestones", []):
+            if m.get("status") == "done":
+                continue
+            try:
+                d = parse_date(m["due_date"])
+            except Exception:
+                continue
+            candidates.append((d, g, m))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return (candidates[0][1], candidates[0][2])
+
+
+def goals_options(goals_data: Dict[str, Any]) -> List[Tuple[str, str]]:
+    # (id, label)
+    opts = [("", "（紐づけない）")]
+    for g in goals_data.get("goals", []):
+        if g.get("archived"):
+            continue
+        title = g.get("title", "").strip() or "（無題）"
+        due = g.get("due_date", "")
+        needs = "要補完" if not (g.get("deliverable", "").strip()) else ""
+        suffix = f" / {due}" + (f" / {needs}" if needs else "")
+        opts.append((g["id"], title + suffix))
+    return opts
+
+
+def milestone_options_for_goal(goals_data: Dict[str, Any], goal_id: str) -> List[Tuple[str, str]]:
+    if not goal_id:
+        return [("", "（紐づけない）")]
+    gmap = goal_lookup(goals_data)
+    g = gmap.get(goal_id)
+    if not g:
+        return [("", "（紐づけない）")]
+    opts = [("", "（紐づけない）")]
+    for m in g.get("milestones", []):
+        title = m.get("title", "").strip() or "（無題）"
+        due = m.get("due_date", "")
+        status = m.get("status", "todo")
+        label = f"{title} / {due} / {status}"
+        opts.append((m["id"], label))
+    return opts
+
+
+# =========================================================
+# Timer / Sessions
+# =========================================================
+
+
+def _get_running_task_id() -> Optional[str]:
+    return st.session_state.get("running_task_id")
+
+
+def _set_running_task_id(task_id: Optional[str]) -> None:
+    st.session_state["running_task_id"] = task_id
+
+
+def _get_timer_state(task_id: str) -> Dict[str, Any]:
+    # timer_state holds start_ts when running, paused flag, etc.
+    states = st.session_state.setdefault("timer_states", {})
+    return states.setdefault(task_id, {"running": False, "start_ts": None, "elapsed_sec": 0})
+
+
+def _save_timer_state(task_id: str, state: Dict[str, Any]) -> None:
+    states = st.session_state.setdefault("timer_states", {})
+    states[task_id] = state
+
+
+def start_timer(day: Dict[str, Any], task_id: str) -> None:
+    t = find_task(day, task_id)
+    if not t:
+        return
+    # Stop any other timer
+    running = _get_running_task_id()
+    if running and running != task_id:
+        pause_timer(day, running)
+
+    state = _get_timer_state(task_id)
+    if state.get("running"):
+        return
+    state["running"] = True
+    state["start_ts"] = now_local().timestamp()
+    _save_timer_state(task_id, state)
+    _set_running_task_id(task_id)
+
+    t["status"] = "doing"
+    update_task(day, t)
+    save_day(day)
+
+
+def pause_timer(day: Dict[str, Any], task_id: str) -> None:
+    t = find_task(day, task_id)
+    if not t:
+        return
+    state = _get_timer_state(task_id)
+    if not state.get("running"):
+        t["status"] = "paused"
+        update_task(day, t)
+        save_day(day)
+        if _get_running_task_id() == task_id:
+            _set_running_task_id(None)
+        return
+
+    start_ts = state.get("start_ts")
+    if start_ts is None:
+        state["running"] = False
+        state["start_ts"] = None
+        _save_timer_state(task_id, state)
+        t["status"] = "paused"
+        update_task(day, t)
+        save_day(day)
+        if _get_running_task_id() == task_id:
+            _set_running_task_id(None)
+        return
+
+    elapsed = int(now_local().timestamp() - float(start_ts))
+    state["elapsed_sec"] = int(state.get("elapsed_sec", 0)) + max(elapsed, 0)
+    state["running"] = False
+    state["start_ts"] = None
+    _save_timer_state(task_id, state)
+
+    t["status"] = "paused"
+    update_task(day, t)
+    save_day(day)
+
+    if _get_running_task_id() == task_id:
+        _set_running_task_id(None)
+
+
+def resume_timer(day: Dict[str, Any], task_id: str) -> None:
+    # Equivalent to start when paused
+    start_timer(day, task_id)
+
+
+def stop_timer_and_record_session(day: Dict[str, Any], task_id: str) -> None:
+    # If running, pause first to accumulate elapsed in timer state
+    pause_timer(day, task_id)
+    state = _get_timer_state(task_id)
+    elapsed_total = int(state.get("elapsed_sec", 0))
+
+    t = find_task(day, task_id)
+    if not t:
+        return
+
+    # Write session record: treat this "elapsed_total" as "this run since last record"
+    # To keep it simple: append a session for this stop, and reset elapsed_sec.
+    # We'll record duration_sec = elapsed_total, with end=now.
+    if elapsed_total > 0:
+        end = now_local()
+        start = end - timedelta(seconds=elapsed_total)
+        sess = {
+            "start": start.isoformat(timespec="seconds"),
+            "end": end.isoformat(timespec="seconds"),
+            "duration_sec": elapsed_total,
+        }
+        t_time = t.setdefault("time", {"sessions": [], "total_sec": 0})
+        t_time.setdefault("sessions", [])
+        t_time.setdefault("total_sec", 0)
+        t_time["sessions"].append(sess)
+        t_time["total_sec"] = int(t_time.get("total_sec", 0)) + elapsed_total
+        t["time"] = t_time
+
+    # Reset timer state
+    state["elapsed_sec"] = 0
+    state["running"] = False
+    state["start_ts"] = None
+    _save_timer_state(task_id, state)
+
+    update_task(day, t)
+    save_day(day)
+    if _get_running_task_id() == task_id:
+        _set_running_task_id(None)
+
+
+def current_elapsed_for_task(task_id: str) -> int:
+    state = _get_timer_state(task_id)
+    elapsed = int(state.get("elapsed_sec", 0))
+    if state.get("running") and state.get("start_ts") is not None:
+        try:
+            elapsed += int(now_local().timestamp() - float(state["start_ts"]))
+        except Exception:
+            pass
+    return max(elapsed, 0)
+
+
+def format_hms(sec: int) -> str:
+    sec = max(0, int(sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+# =========================================================
+# Suggestions / UI helpers
+# =========================================================
+
+
+def init_session_defaults() -> None:
+    st.session_state.setdefault("rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR)
+    st.session_state.setdefault("mode", "今日することをまとめる")
+    st.session_state.setdefault("suggestions", list(DEFAULT_SUGGESTIONS))
+    st.session_state.setdefault("last_plan_date", None)
+    st.session_state.setdefault("toast_queue", [])
+    st.session_state.setdefault("progress_notified", {})  # {task_id: bool}
+    st.session_state.setdefault("timer_states", {})
+    st.session_state.setdefault("running_task_id", None)
+    st.session_state.setdefault("toast_last_shown_ts", 0.0)
+
+
+    # To prevent Streamlit session_state widget mutation issues,
+    # do NOT set values of keys after widget instantiation.
+    # Keep widget keys unique and only pre-fill via session_state before widgets render.
+
+
+from typing import Optional, Dict, Any, List
+
+def push_toast(msg: str, icon: Optional[str] = "✅") -> None:
+    q = st.session_state.setdefault("toast_queue", [])
+    q.append({"msg": msg, "icon": icon, "ts": now_local().timestamp()})
+    st.session_state["toast_queue"] = q
+
+
+
+def flush_toasts() -> None:
+    q = st.session_state.get("toast_queue", [])
+    if not q:
+        return
+
+    # 先に空にする（rerun連発でも出続けない）
+    st.session_state["toast_queue"] = []
+
+    for item in q:
+        msg = (item.get("msg") or "").strip()
+        if not msg:
+            continue
+
+        icon = item.get("icon")  # 無ければNone
+
+        if hasattr(st, "toast"):
+            # iconがNoneなら引数を省略（より安全）
+            if icon:
+                st.toast(msg, icon=icon)
+            else:
+                st.toast(msg)
+        else:
+            st.info(msg)
+
+
+def beep_sound() -> None:
+    # Simple beep via HTML audio (may be blocked depending on browser)
+    st.markdown(
+        """
+        <audio autoplay>
+            <source src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAIA+AAABAAgAZGF0YQAAAAA=" type="audio/wav">
+        </audio>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def safe_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+# =========================================================
+# Reports (14-day)
+# =========================================================
+
+
+def list_day_files() -> List[Path]:
+    ensure_dirs()
+    return sorted(DAYS_DIR.glob("*.json"))
+
+
+def load_days_in_range(start_d: date, end_d: date) -> List[Dict[str, Any]]:
+    # inclusive
+    days: List[Dict[str, Any]] = []
+    d = start_d
+    while d <= end_d:
+        p = day_path(d)
+        if p.exists():
+            days.append(load_day(d))
+        d += timedelta(days=1)
+    return days
+
+
+def summarize_14_days(goals_data: Dict[str, Any], ref: date, rollover_hour: int) -> Dict[str, Any]:
+    end_d = ref
+    start_d = ref - timedelta(days=13)
+    days = load_days_in_range(start_d, end_d)
+
+    total_sec = 0
+    day_rows: List[Dict[str, Any]] = []
+    category_sec: Dict[str, int] = {c: 0 for c in CATEGORIES}
+    status_counts = {"done": 0, "cut": 0, "todo": 0}
+
+    gmap = goal_lookup(goals_data)
+    mmap = milestone_lookup(goals_data)
+
+    contrib_goal: Dict[str, int] = {}
+    contrib_milestone: Dict[str, int] = {}
+
+    for d in days:
+        d_date = d.get("date", "")
+        tasks = d.get("tasks", [])
+        day_total = 0
+        done = 0
+        cut = 0
+        for t in tasks:
+            tt = t.get("time", {})
+            tsec = safe_int(tt.get("total_sec", 0), 0)
+            day_total += tsec
+            total_sec += tsec
+            cat = t.get("category", "その他")
+            if cat not in category_sec:
+                category_sec[cat] = 0
+            category_sec[cat] += tsec
+            stt = t.get("status", "todo")
+            if stt == "done":
+                done += 1
+                status_counts["done"] += 1
+            elif stt == "cut":
+                cut += 1
+                status_counts["cut"] += 1
+            else:
+                status_counts["todo"] += 1
+
+            gid = t.get("goal_id") or ""
+            mid = t.get("milestone_id") or ""
+            if gid:
+                contrib_goal[gid] = contrib_goal.get(gid, 0) + tsec
+            if mid:
+                contrib_milestone[mid] = contrib_milestone.get(mid, 0) + tsec
+
+        day_rows.append(
+            {
+                "date": d_date,
+                "total_sec": day_total,
+                "task_count": len(tasks),
+                "done": done,
+                "cut": cut,
+                "closed": bool(d.get("closed", False)),
+            }
+        )
+
+    # Build positive narrative (no blame)
+    best_day = None
+    if day_rows:
+        best_day = max(day_rows, key=lambda r: r["total_sec"])
+
+    # map contributions to readable labels
+    contrib_goal_named: List[Tuple[str, int]] = []
+    for gid, sec in sorted(contrib_goal.items(), key=lambda x: x[1], reverse=True):
+        g = gmap.get(gid, {})
+        title = (g.get("title") or "（無題の目標）").strip()
+        contrib_goal_named.append((title, sec))
+
+    contrib_milestone_named: List[Tuple[str, int]] = []
+    # Need to attach goal title to milestone for clarity
+    milestone_to_goal_title: Dict[str, str] = {}
+    for g in goals_data.get("goals", []):
+        gt = (g.get("title") or "（無題の目標）").strip()
+        for m in g.get("milestones", []):
+            milestone_to_goal_title[m.get("id", "")] = gt
+
+    for mid, sec in sorted(contrib_milestone.items(), key=lambda x: x[1], reverse=True):
+        m = mmap.get(mid, {})
+        mt = (m.get("title") or "（無題のマイルストーン）").strip()
+        gt = milestone_to_goal_title.get(mid, "（目標不明）")
+        contrib_milestone_named.append((f"{gt} / {mt}", sec))
+
+    # Category ranking
+    cat_rank = sorted(category_sec.items(), key=lambda x: x[1], reverse=True)
+
+    report = {
+        "range": {"start": fmt_date(start_d), "end": fmt_date(end_d)},
+        "total_sec": total_sec,
+        "days": day_rows,
+        "category_sec": category_sec,
+        "category_rank": cat_rank,
+        "status_counts": status_counts,
+        "best_day": best_day,
+        "contrib_goal": contrib_goal_named,
+        "contrib_milestone": contrib_milestone_named,
+        "rollover_hour": rollover_hour,
+        "generated_at": now_local().isoformat(timespec="seconds"),
+    }
+    return report
+
+
+def render_report_text(report: Dict[str, Any]) -> str:
+    start = report["range"]["start"]
+    end = report["range"]["end"]
+    total_sec = report.get("total_sec", 0)
+    total_h = total_sec / 3600.0 if total_sec else 0.0
+
+    status = report.get("status_counts", {})
+    done = status.get("done", 0)
+    cut = status.get("cut", 0)
+    todo = status.get("todo", 0)
+
+    best = report.get("best_day")
+    best_line = ""
+    if best:
+        best_line = f"- いちばん積み上がった日: {best['date']}（{best['total_sec']/3600:.2f}h）"
+
+    # Top 3 categories
+    cat_rank = report.get("category_rank", [])
+    top_cats = cat_rank[:3] if cat_rank else []
+    top_cat_lines = "\n".join([f"  - {c}: {sec/3600:.2f}h" for c, sec in top_cats])
+
+    # Goals contribution
+    contrib_goal = report.get("contrib_goal", [])[:5]
+    contrib_goal_lines = "\n".join([f"  - {name}: {sec/3600:.2f}h" for name, sec in contrib_goal]) if contrib_goal else "  - （紐づけがあるものはまだありません）"
+
+    contrib_ms = report.get("contrib_milestone", [])[:5]
+    contrib_ms_lines = "\n".join([f"  - {name}: {sec/3600:.2f}h" for name, sec in contrib_ms]) if contrib_ms else "  - （紐づけがあるものはまだありません）"
+
+    # Gentle next step
+    next_step = "次の2週間は、**いちばん近いマイルストーン**に紐づけて、短いタスクを1つだけでも回せると、積み上がりがさらに見えやすくなります。"
+
+    txt = f"""# 2週間レポート（{start}〜{end}）
+
+あなたの記録がちゃんと残っています。ここまで積み上げられたこと自体が、まず価値です。
+
+## 概要
+- 合計稼働: {total_h:.2f} 時間
+- タスク内訳: 完了 {done} / 区切り {cut} / その他 {todo}
+{best_line}
+
+## よく取り組んだ領域（上位）
+{top_cat_lines if top_cat_lines else "  - （データがまだ少ないため、これから育ちます）"}
+
+## 目標への貢献（紐づけがあるもの）
+{contrib_goal_lines}
+
+## マイルストーンへの貢献（紐づけがあるもの）
+{contrib_ms_lines}
+
+## 次の一歩（やさしい提案）
+{next_step}
+"""
+    return txt
+
+
+# =========================================================
+# Notification: "2 minutes after planned end"
+# =========================================================
+
+
+def should_notify_progress(task: Dict[str, Any]) -> bool:
+    # planned end = est_min minutes from first start
+    # notify at planned_end + 2 minutes
+    # use session_state.progress_notified to avoid repeat
+    task_id = task.get("id", "")
+    if not task_id:
+        return False
+    if st.session_state.get("progress_notified", {}).get(task_id):
+        return False
+
+    # Need at least one session start to reference
+    time_info = task.get("time", {})
+    sessions = time_info.get("sessions", [])
+    # If currently running, we can use timer start; otherwise use first session start.
+    # We'll approximate: first start = first session start or current timer start.
+    first_start_dt: Optional[datetime] = None
+
+    # If there's a recorded session, use its start
+    if sessions:
+        try:
+            first_start_dt = datetime.fromisoformat(sessions[0]["start"])
+        except Exception:
+            first_start_dt = None
+
+    # If none and currently running, use timer start_ts
+    state = _get_timer_state(task_id)
+    if first_start_dt is None and state.get("running") and state.get("start_ts"):
+        try:
+            first_start_dt = datetime.fromtimestamp(float(state["start_ts"]))
+        except Exception:
+            first_start_dt = None
+
+    if first_start_dt is None:
+        return False
+
+    est_min = safe_int(task.get("est_min", 0), 0)
+    planned_end = first_start_dt + timedelta(minutes=est_min)
+    notify_time = planned_end + timedelta(minutes=2)
+    return now_local() >= notify_time
+
+
+def mark_notified(task_id: str) -> None:
+    pn = st.session_state.get("progress_notified", {})
+    pn[task_id] = True
+    st.session_state["progress_notified"] = pn
+
+
+# =========================================================
+# UI: Sidebar blocks
+# =========================================================
+
+
+def sidebar_snapshot(day: Dict[str, Any], goals_data: Dict[str, Any]) -> None:
+    st.sidebar.subheader("今日のスナップショット")
+    tasks = day.get("tasks", [])
+    if not tasks:
+        st.sidebar.caption("まだタスクがありません。")
+        return
+
+    gmap = goal_lookup(goals_data)
+    mmap = milestone_lookup(goals_data)
+
+    for t in tasks:
+        status = t.get("status", "todo")
+        chip = {
+            "todo": "未",
+            "doing": "▶",
+            "paused": "⏸",
+            "done": "✅",
+            "cut": "⏭",
+        }.get(status, "・")
+        label = (t.get("short") or "").strip() or "（未入力）"
+        meta = []
+        if t.get("goal_id"):
+            g = gmap.get(t["goal_id"], {})
+            meta.append((g.get("title") or "目標").strip())
+        if t.get("milestone_id"):
+            m = mmap.get(t["milestone_id"], {})
+            meta.append((m.get("title") or "MS").strip())
+        meta_s = f" 〔{' / '.join(meta)}〕" if meta else ""
+        st.sidebar.write(f"{chip} {label}{meta_s}")
+
+
+def sidebar_goals(goals_data: Dict[str, Any]) -> None:
+    st.sidebar.subheader("遠い目標（β）")
+    goals = [g for g in goals_data.get("goals", []) if not g.get("archived")]
+    if not goals:
+        st.sidebar.caption("まだ目標がありません。")
+        return
+
+    for g in sorted(goals, key=lambda x: x.get("due_date", "")):
+        title = (g.get("title") or "（無題）").strip()
+        due = g.get("due_date", "")
+        deliverable = (g.get("deliverable") or "").strip()
+        needs = "要補完" if not deliverable else ""
+        st.sidebar.markdown(f"**{title}**")
+        st.sidebar.caption(f"期限: {due}" + (f" / {needs}" if needs else ""))
+        if deliverable:
+            st.sidebar.caption(f"成果物: {deliverable[:60]}{'…' if len(deliverable)>60 else ''}")
+        # Show nearest milestone for this goal
+        ms = [m for m in g.get("milestones", []) if m.get("status") != "done"]
+        if ms:
+            ms.sort(key=lambda m: m.get("due_date", ""))
+            m0 = ms[0]
+            st.sidebar.caption(f"次のMS: {m0.get('title','（無題）')} / {m0.get('due_date','')}")
+        st.sidebar.divider()
+
+
+def sidebar_next_milestone(goals_data: Dict[str, Any], ref: date) -> None:
+    st.sidebar.subheader("次のマイルストーン")
+    nm = next_upcoming_milestone(goals_data, ref)
+    if not nm:
+        st.sidebar.caption("未完了のマイルストーンはありません。")
+        return
+    g, m = nm
+    gt = (g.get("title") or "（無題の目標）").strip()
+    mt = (m.get("title") or "（無題のMS）").strip()
+    due = m.get("due_date", "")
+    deliverable = (m.get("deliverable") or "").strip()
+
+    st.sidebar.markdown(f"**{gt}**")
+    st.sidebar.write(f"**{mt}**")
+    st.sidebar.caption(f"期限: {due}")
+    if deliverable:
+        st.sidebar.caption(f"成果物: {deliverable[:80]}{'…' if len(deliverable)>80 else ''}")
+
+
+def sidebar_dashboard(day: Dict[str, Any], ref: date) -> None:
+    st.sidebar.subheader("記録ダッシュボード")
+    # Show last 7 days totals
+    rows = []
+    for i in range(6, -1, -1):
+        d = ref - timedelta(days=i)
+        p = day_path(d)
+        if not p.exists():
+            rows.append((fmt_date(d), 0, 0, 0))
+            continue
+        dd = load_day(d)
+        tasks = dd.get("tasks", [])
+        tot = 0
+        done = 0
+        for t in tasks:
+            tot += safe_int(t.get("time", {}).get("total_sec", 0), 0)
+            if t.get("status") == "done":
+                done += 1
+        rows.append((fmt_date(d), tot, len(tasks), done))
+
+    total_7 = sum(r[1] for r in rows)
+    st.sidebar.metric("直近7日 合計", f"{total_7/3600:.2f}h")
+    # Compact table
+    for dt, sec, n, done in rows[-7:]:
+        st.sidebar.caption(f"{dt}: {sec/3600:.2f}h / {done}/{n}完了")
+
+
+def sidebar_report(goals_data: Dict[str, Any], ref: date, rollover_hour: int) -> None:
+    if not FEATURE_FLAGS.get("monitor_report", True):
+        return
+    st.sidebar.subheader("2週間レポート")
+    if st.sidebar.button("生成 / 更新", use_container_width=True):
+        rep = summarize_14_days(goals_data, ref, rollover_hour)
+        st.session_state["report_latest"] = rep
+        push_toast("2週間レポートを更新しました。")
+
+    rep = st.session_state.get("report_latest")
+    if rep:
+        txt = render_report_text(rep)
+        st.sidebar.caption(f"対象: {rep['range']['start']}〜{rep['range']['end']}")
+        st.sidebar.download_button(
+            label="レポートをtxtで保存",
+            data=txt,
+            file_name=f"report_{rep['range']['start']}_{rep['range']['end']}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+        # Minimal snippet
+        st.sidebar.caption("要約:")
+        st.sidebar.write(f"- 合計: {rep['total_sec']/3600:.2f}h")
+        st.sidebar.write(f"- 完了: {rep['status_counts'].get('done',0)} / 区切り: {rep['status_counts'].get('cut',0)}")
+
+
+# =========================================================
+# UI: Goals Editor (Sidebar & Page)
+# =========================================================
+
+
+def goals_editor(goals_data: Dict[str, Any]) -> Dict[str, Any]:
+    st.header("遠い目標（β）")
+    st.caption("締切だけでは弱いので、「成果物（達成条件）」を必須にしています。複数の目標を設定できます。")
+
+    goals = goals_data.get("goals", [])
+
+        # ---- Add new goal (form) ----
+    default_due = today_research_date(
+        st.session_state.get("rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR)
+    ) + timedelta(days=14)
+
+    with st.expander("＋ 目標を追加", expanded=False):
+        with st.form("add_goal_form", clear_on_submit=True):
+            title = st.text_input(
+                "目標タイトル",
+                key="new_goal_title",
+                placeholder="例：学会発表 / 資格試験 / レポート提出",
+            )
+            due = st.date_input("期限", value=default_due, key="new_goal_due")
+            deliverable = st.text_area(
+                "成果物（達成条件）※必須",
+                key="new_goal_deliverable",
+                placeholder="例：スライド20枚＋要旨最終版＋予行2回\n例：第3章の結果まで書き切る",
+                height=80,
+            )
+            submitted = st.form_submit_button("追加", use_container_width=True)
+
+        if submitted:
+            if not (deliverable or "").strip():
+                st.error("成果物（達成条件）は必須です。短くて大丈夫です。")
+            else:
+                g = {
+                    "id": str(uuid.uuid4()),
+                    "title": (title or "").strip() or "（無題）",
+                    "due_date": fmt_date(due),
+                    "deliverable": deliverable.strip(),
+                    "created_at": now_local().isoformat(timespec="seconds"),
+                    "archived": False,
+                    "milestones": [],
+                }
+                goals.append(g)
+                goals_data["goals"] = goals
+                save_goals(goals_data)
+                push_toast("目標を追加しました。")
+                st.rerun()
+
+
+    # Existing goals list
+    if not goals:
+        st.info("まだ目標がありません。上の「目標を追加」から作れます。")
+        return goals_data
+
+    st.subheader("目標一覧")
+    for gi, g in enumerate(sorted(goals, key=lambda x: (x.get("archived", False), x.get("due_date", "")))):
+        gid = g.get("id", f"g_{gi}")
+        archived = bool(g.get("archived", False))
+        title = (g.get("title") or "（無題）").strip()
+        due = g.get("due_date", "")
+        deliverable = (g.get("deliverable") or "").strip()
+        needs = "要補完" if not deliverable else ""
+        badge = "（アーカイブ）" if archived else ""
+        st.markdown(f"### {title} {badge}")
+        cols = st.columns([1, 1, 2])
+        with cols[0]:
+            st.caption("期限")
+            st.write(due)
+        with cols[1]:
+            st.caption("状態")
+            st.write(needs or "OK")
+        with cols[2]:
+            st.caption("成果物（達成条件）")
+            st.write(deliverable if deliverable else "（未入力：編集して補完できます）")
+
+        # Edit block
+        with st.expander("編集 / マイルストーン", expanded=False):
+            # Pre-fill keys for widgets
+            k_title = f"g_title_{gid}"
+            k_due = f"g_due_{gid}"
+            k_deliv = f"g_deliv_{gid}"
+            k_arch = f"g_arch_{gid}"
+
+            if k_title not in st.session_state:
+                st.session_state[k_title] = title
+            if k_deliv not in st.session_state:
+                st.session_state[k_deliv] = deliverable
+            if k_due not in st.session_state:
+                try:
+                    st.session_state[k_due] = parse_date(due)
+                except Exception:
+                    st.session_state[k_due] = today_research_date(st.session_state.get("rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR)) + timedelta(days=14)
+            if k_arch not in st.session_state:
+                st.session_state[k_arch] = archived
+
+            new_title = st.text_input("目標タイトル", key=k_title)
+            new_due = st.date_input("期限", key=k_due)
+            new_deliv = st.text_area("成果物（達成条件）※必須", key=k_deliv, height=80)
+            new_arch = st.checkbox("アーカイブする", key=k_arch)
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if st.button("保存", key=f"save_goal_{gid}", use_container_width=True):
+                    if not (new_deliv or "").strip():
+                        st.error("成果物（達成条件）は必須です。短くて大丈夫です。")
+                    else:
+                        # Update goal
+                        g["title"] = (new_title or "").strip() or "（無題）"
+                        g["due_date"] = fmt_date(new_due)
+                        g["deliverable"] = new_deliv.strip()
+                        g["archived"] = bool(new_arch)
+                        save_goals(goals_data)
+                        push_toast("目標を保存しました。")
+                        st.rerun()
+            with c2:
+                if st.button("削除", key=f"del_goal_{gid}", use_container_width=True):
+                    # Soft delete: archive and clear title
+                    g["archived"] = True
+                    save_goals(goals_data)
+                    push_toast("目標をアーカイブしました。")
+                    st.rerun()
+
+            # Milestones
+            st.markdown("#### マイルストーン（中間締切）")
+            ms_list = g.get("milestones", [])
+            if not ms_list:
+                st.caption("まだマイルストーンがありません。下から追加できます。")
+            else:
+                for mi, m in enumerate(sorted(ms_list, key=lambda x: x.get("due_date", ""))):
+                    mid = m.get("id", f"m_{mi}")
+                    mt = (m.get("title") or "（無題）").strip()
+                    mdue = m.get("due_date", "")
+                    mdel = (m.get("deliverable") or "").strip()
+                    mstat = m.get("status", "todo")
+
+                    st.markdown(f"- **{mt}** / {mdue} / {mstat}")
+                    if mdel:
+                        st.caption(f"成果物: {mdel}")
+
+                    with st.expander(f"編集: {mt}", expanded=False):
+                        km_t = f"m_title_{mid}"
+                        km_d = f"m_due_{mid}"
+                        km_del = f"m_del_{mid}"
+                        km_s = f"m_stat_{mid}"
+
+                        if km_t not in st.session_state:
+                            st.session_state[km_t] = mt
+                        if km_del not in st.session_state:
+                            st.session_state[km_del] = mdel
+                        if km_d not in st.session_state:
+                            try:
+                                st.session_state[km_d] = parse_date(mdue)
+                            except Exception:
+                                st.session_state[km_d] = today_research_date(st.session_state.get("rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR)) + timedelta(days=7)
+                        if km_s not in st.session_state:
+                            st.session_state[km_s] = mstat
+
+                        mt2 = st.text_input("タイトル", key=km_t)
+                        md2 = st.date_input("期限", key=km_d)
+                        mdel2 = st.text_area("成果物（達成条件）", key=km_del, height=70, placeholder="例：要旨400字ドラフト1本")
+                        ms2 = st.selectbox("状態", options=["todo", "doing", "done"], key=km_s, format_func=lambda x: {"todo":"未着手","doing":"進行中","done":"完了"}[x])
+
+                        c1m, c2m = st.columns([1, 1])
+                        with c1m:
+                            if st.button("保存", key=f"save_ms_{mid}", use_container_width=True):
+                                m["title"] = (mt2 or "").strip() or "（無題）"
+                                m["due_date"] = fmt_date(md2)
+                                m["deliverable"] = (mdel2 or "").strip()
+                                m["status"] = ms2
+                                save_goals(goals_data)
+                                push_toast("マイルストーンを保存しました。")
+                                st.rerun()
+                        with c2m:
+                            if st.button("削除", key=f"del_ms_{mid}", use_container_width=True):
+                                # Remove from list
+                                g["milestones"] = [x for x in g.get("milestones", []) if x.get("id") != mid]
+                                save_goals(goals_data)
+                                push_toast("マイルストーンを削除しました。")
+                                st.rerun()
+
+            st.divider()
+            st.markdown("#### ＋ マイルストーンを追加")
+            # Pre-fill add milestone keys
+            k_add_t = f"add_ms_title_{gid}"
+            k_add_d = f"add_ms_due_{gid}"
+            k_add_del = f"add_ms_del_{gid}"
+            k_add_s = f"add_ms_stat_{gid}"
+
+            if k_add_d not in st.session_state:
+                # default: 7 days before goal due or in 7 days
+                try:
+                    g_due = parse_date(g.get("due_date", fmt_date(today_research_date(DEFAULT_DAY_ROLLOVER_HOUR))))
+                    st.session_state[k_add_d] = max(today_research_date(st.session_state.get("rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR)), g_due - timedelta(days=7))
+                except Exception:
+                    st.session_state[k_add_d] = today_research_date(st.session_state.get("rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR)) + timedelta(days=7)
+            if k_add_s not in st.session_state:
+                st.session_state[k_add_s] = "todo"
+
+            add_t = st.text_input("タイトル", key=k_add_t, placeholder="例：要旨ドラフト / 図1を完成 / 方法を400字")
+            add_d = st.date_input("期限", key=k_add_d)
+            add_del = st.text_area("成果物（達成条件）", key=k_add_del, height=70, placeholder="例：400字ドラフトを1本 / 図の軸と凡例を確定")
+            add_s = st.selectbox("状態", options=["todo", "doing", "done"], key=k_add_s, format_func=lambda x: {"todo":"未着手","doing":"進行中","done":"完了"}[x])
+
+            if st.button("追加", key=f"add_ms_btn_{gid}", use_container_width=True):
+                m = {
+                    "id": str(uuid.uuid4()),
+                    "title": (add_t or "").strip() or "（無題）",
+                    "due_date": fmt_date(add_d),
+                    "deliverable": (add_del or "").strip(),
+                    "status": add_s,
+                }
+                g.setdefault("milestones", [])
+                g["milestones"].append(m)
+                save_goals(goals_data)
+                push_toast("マイルストーンを追加しました。")
+                st.session_state[k_add_t] = ""
+                st.session_state[k_add_del] = ""
+                st.rerun()
+
+        st.divider()
+
+    return goals_data
+
+
+# =========================================================
+# Planning Page: "今日することをまとめる"
+# =========================================================
+
+
+def planning_page(day: Dict[str, Any], goals_data: Dict[str, Any], ref: date) -> Dict[str, Any]:
+    st.header("今日することをまとめる")
+    st.caption("入力は短く、選びやすく。最後に「今日へ反映」で今日のタスクが固まります。")
+
+    # Suggestions editor (user requested earlier: edit/add)
+    st.subheader("ワンタップ提案（編集できます）")
+    suggestions: List[str] = st.session_state.get("suggestions", [])
+    if not suggestions:
+        suggestions = list(DEFAULT_SUGGESTIONS)
+        st.session_state["suggestions"] = suggestions
+
+    with st.expander("提案を編集 / 追加", expanded=False):
+        # Editable list
+        new_list: List[str] = []
+        for i, s in enumerate(suggestions):
+            key = f"sugg_{i}"
+            if key not in st.session_state:
+                st.session_state[key] = s
+            val = st.text_input(f"提案 {i+1}", key=key)
+            if (val or "").strip():
+                new_list.append(val.strip())
+
+        # Add new
+        if "sugg_new" not in st.session_state:
+            st.session_state["sugg_new"] = ""
+        add_val = st.text_input("新しい提案を追加", key="sugg_new", placeholder="例：先行研究を1本だけ読んで要点を残す")
+        if st.button("追加", key="add_sugg_btn"):
+            if (add_val or "").strip():
+                new_list.append(add_val.strip())
+                st.session_state["sugg_new"] = ""
+                # Update session state list
+                st.session_state["suggestions"] = new_list
+                push_toast("提案を追加しました。")
+                st.rerun()
+
+        if st.button("保存（置き換え）", key="save_sugg_btn"):
+            st.session_state["suggestions"] = new_list
+            push_toast("提案を保存しました。")
+            st.rerun()
+
+    # Select a suggestion to prefill a planned task
+    st.caption("下から選ぶと、タスク入力に反映されます。時間はあとで自由に変えられます。")
+    sugg_cols = st.columns(3)
+    for i, s in enumerate(st.session_state.get("suggestions", [])):
+        with sugg_cols[i % 3]:
+            if st.button(s[:24] + ("…" if len(s) > 24 else ""), key=f"use_sugg_{i}", use_container_width=True):
+                st.session_state["draft_short"] = s
+                push_toast("提案をタスク入力に入れました。")
+
+    st.divider()
+
+    # Draft input (not saved yet)
+    st.subheader("今日のタスク（最大3つ推奨）")
+    st.caption("「成果物」ではなく **「やること（短く）」** で入力してください。")
+
+    if "draft_tasks" not in st.session_state:
+        st.session_state["draft_tasks"] = []
+
+    # helper to create draft task
+    def make_draft_task() -> Dict[str, Any]:
+        return {
+            "id": str(uuid.uuid4()),
+            "short": st.session_state.get("draft_short", ""),
+            "category": "先行研究",
+            "est_min": 60,
+            "goal_id": "",
+            "milestone_id": "",
+        }
+
+    # Add button
+    add_col1, add_col2 = st.columns([1, 2])
+    with add_col1:
+        if st.button("＋ タスク追加", use_container_width=True):
+            st.session_state["draft_tasks"].append(make_draft_task())
+            st.session_state["draft_short"] = ""
+            st.rerun()
+    with add_col2:
+        st.caption("目安：3つまで（多い日は“保留”として明日に回すのがおすすめ）")
+
+    draft_tasks: List[Dict[str, Any]] = st.session_state.get("draft_tasks", [])
+
+    if not draft_tasks:
+        st.info("「＋ タスク追加」から今日のタスクを作れます。")
+    else:
+        # Goal options
+        gopts = goals_options(goals_data)
+
+        for idx, dtask in enumerate(draft_tasks):
+            tid = dtask["id"]
+            st.markdown(f"#### タスク {idx+1}")
+            c1, c2, c3 = st.columns([2, 1, 1])
+
+            k_short = f"draft_short_{tid}"
+            k_cat = f"draft_cat_{tid}"
+            k_est = f"draft_est_{tid}"
+            k_goal = f"draft_goal_{tid}"
+            k_ms = f"draft_ms_{tid}"
+
+            # Pre-fill keys before widget creation
+            if k_short not in st.session_state:
+                st.session_state[k_short] = dtask.get("short", "")
+            if k_cat not in st.session_state:
+                st.session_state[k_cat] = dtask.get("category", "先行研究")
+            if k_est not in st.session_state:
+                st.session_state[k_est] = int(dtask.get("est_min", 60))
+            if k_goal not in st.session_state:
+                st.session_state[k_goal] = dtask.get("goal_id", "")
+            if k_ms not in st.session_state:
+                st.session_state[k_ms] = dtask.get("milestone_id", "")
+
+            with c1:
+                short = st.text_input("やること（短く）", key=k_short, placeholder="例：要旨ドラフトを200字だけ")
+                cat = st.selectbox("カテゴリ", CATEGORIES, key=k_cat)
+            with c2:
+                est = st.number_input("目安（分）", min_value=5, max_value=600, step=5, key=k_est)
+            with c3:
+                # Remove
+                if st.button("削除", key=f"rm_draft_{tid}", use_container_width=True):
+                    st.session_state["draft_tasks"] = [x for x in draft_tasks if x["id"] != tid]
+                    st.rerun()
+
+            # Link goal/milestone (optional)
+            st.caption("（任意）このタスクはどの目標のため？")
+            # goal select
+            goal_ids = [x[0] for x in gopts]
+            goal_labels = [x[1] for x in gopts]
+            # Determine index from stored value
+            cur_goal = st.session_state.get(k_goal, "")
+            try:
+                g_idx = goal_ids.index(cur_goal)
+            except ValueError:
+                g_idx = 0
+
+            selected_goal = st.selectbox(
+                "目標",
+                options=goal_ids,
+                index=g_idx,
+                format_func=lambda x: dict(gopts).get(x, "（紐づけない）"),
+                key=k_goal,
+            )
+
+            # milestone options depend on selected_goal
+            ms_opts = milestone_options_for_goal(goals_data, selected_goal)
+            ms_ids = [x[0] for x in ms_opts]
+            cur_ms = st.session_state.get(k_ms, "")
+            try:
+                ms_idx = ms_ids.index(cur_ms)
+            except ValueError:
+                ms_idx = 0
+
+            selected_ms = st.selectbox(
+                "マイルストーン",
+                options=ms_ids,
+                index=ms_idx,
+                format_func=lambda x: dict(ms_opts).get(x, "（紐づけない）"),
+                key=k_ms,
+            )
+
+            # Write back to draft_tasks structure (safe: not session_state widget key)
+            dtask["short"] = short
+            dtask["category"] = cat
+            dtask["est_min"] = int(est)
+            dtask["goal_id"] = selected_goal
+            dtask["milestone_id"] = selected_ms
+
+            st.divider()
+
+        st.session_state["draft_tasks"] = draft_tasks
+
+    # Highlight nearest milestone (recommendation) without forcing
+    st.subheader("今日の焦点（おすすめ）")
+    nm = next_upcoming_milestone(goals_data, ref)
+    if nm:
+        g, m = nm
+        st.info(
+            f"いちばん近い未完了のマイルストーンは **{g.get('title','（無題）')} / {m.get('title','（無題）')}**（期限: {m.get('due_date','')}）です。"
+        )
+        if (m.get("deliverable") or "").strip():
+            st.caption(f"成果物: {m.get('deliverable')}")
+    else:
+        st.caption("未完了のマイルストーンはまだありません。必要になったら追加できます。")
+
+    st.divider()
+
+    # Apply to "Today"
+    st.subheader("今日へ反映")
+    st.caption("ここで反映した内容が「今日」画面に表示されます。あとからタスク追加しても最後に保存されます。")
+
+    if st.button("今日へ反映する", use_container_width=True):
+        # Build task list into day (additive, do not erase existing tasks unless empty)
+        # Policy: if day already has tasks and user re-applies, append new tasks (avoid losing work).
+        existing_ids = {t.get("id") for t in day.get("tasks", [])}
+        new_tasks = []
+        for dtask in st.session_state.get("draft_tasks", []):
+            if not (dtask.get("short") or "").strip():
+                continue
+            t = {
+                "id": dtask["id"] if dtask["id"] not in existing_ids else str(uuid.uuid4()),
+                "short": (dtask["short"] or "").strip(),
+                "category": dtask.get("category", "その他"),
+                "est_min": int(dtask.get("est_min", 25)),
+                "status": "todo",
+                "time": {"sessions": [], "total_sec": 0},
+                "done_note": "",
+                "goal_id": dtask.get("goal_id") or "",
+                "milestone_id": dtask.get("milestone_id") or "",
+            }
+            new_tasks.append(ensure_task_shape(t))
+
+        if not new_tasks:
+            st.warning("反映するタスクがありません。まずタスクを追加してください。")
+        else:
+            day.setdefault("tasks", [])
+            day["tasks"].extend(new_tasks)
+            # Keep a plan snapshot (optional)
+            day["plan"] = {
+                "applied_at": now_local().isoformat(timespec="seconds"),
+                "draft_task_count": len(new_tasks),
+            }
+            save_day(day)
+            push_toast("今日へ反映しました。")
+            st.session_state["mode"] = "今日"
+            st.rerun()
+
+    return day
+
+
+# =========================================================
+# Today Page: "今日" (execution)
+# =========================================================
+
+
+def _task_status_chip(status: str) -> str:
+    return {
+        "todo": "未",
+        "doing": "▶",
+        "paused": "⏸",
+        "done": "✅",
+        "cut": "⏭",
+    }.get(status, "・")
+
+
+def today_page(day: Dict[str, Any], goals_data: Dict[str, Any], ref: date) -> Dict[str, Any]:
+    st.header("今日")
+    st.caption("始める → 中断 → 再開。区切る/完了する。積み上げが残ります。")
+
+    tasks = [ensure_task_shape(t) for t in day.get("tasks", [])]
+    day["tasks"] = tasks
+
+    if not tasks:
+        st.info("まだ今日のタスクがありません。「今日することをまとめる」から反映してください。")
+        return day
+
+    # Autorefresh for timer (once per second)
+    if st_autorefresh is not None:
+        st_autorefresh(interval=1000, key="timer_refresh")
+
+    flush_toasts()
+
+    # Progress notifications check
+    for t in tasks:
+        if t.get("status") in ("doing", "paused", "todo"):
+            if should_notify_progress(t):
+                push_toast("進捗どうですか？必要なら区切っても大丈夫です。")
+                # Optional beep (user can turn off later)
+                # beep_sound()
+                mark_notified(t.get("id", ""))
+
+    gmap = goal_lookup(goals_data)
+    mmap = milestone_lookup(goals_data)
+
+    st.subheader("今日のタスク")
+    for t in tasks:
+        tid = t["id"]
+        status = t.get("status", "todo")
+        chip = _task_status_chip(status)
+        short = (t.get("short") or "").strip() or "（未入力）"
+        cat = t.get("category", "その他")
+        est = safe_int(t.get("est_min", 0), 0)
+
+        # Labels from links
+        meta: List[str] = []
+        gid = (t.get("goal_id") or "").strip()
+        mid = (t.get("milestone_id") or "").strip()
+        if gid:
+            g = gmap.get(gid, {})
+            meta.append((g.get("title") or "目標").strip())
+        if mid:
+            m = mmap.get(mid, {})
+            meta.append((m.get("title") or "MS").strip())
+
+        meta_s = " / ".join(meta)
+
+        with st.container(border=True):
+            top = st.columns([3, 1])
+            with top[0]:
+                st.markdown(f"**{chip} {short}**")
+                st.caption(f"カテゴリ: {cat} / 目安: {est}分" + (f" / {meta_s}" if meta_s else ""))
+
+            with top[1]:
+                elapsed = current_elapsed_for_task(tid)
+                st.metric("稼働", format_hms(elapsed))
+
+            # Controls: Start/Pause/Resume in same place
+            ctrl = st.columns([1, 1, 2])
+            with ctrl[0]:
+                if status in ("todo", "paused"):
+                    if st.button("開始" if status == "todo" else "再開", key=f"start_{tid}", use_container_width=True):
+                        start_timer(day, tid)
+                        st.rerun()
+                elif status == "doing":
+                    if st.button("中断", key=f"pause_{tid}", use_container_width=True):
+                        pause_timer(day, tid)
+                        st.rerun()
+                else:
+                    st.button("—", key=f"noop_{tid}", disabled=True, use_container_width=True)
+
+            with ctrl[1]:
+                # Complete / Cut
+                if st.button("区切る/完了", key=f"finish_{tid}", use_container_width=True):
+                    st.session_state["finish_target"] = tid
+                    st.session_state["finish_open"] = True
+                    st.rerun()
+
+            with ctrl[2]:
+                # Minimal info
+                tot = safe_int(t.get("time", {}).get("total_sec", 0), 0)
+                st.caption(f"累計: {tot/60:.0f}分 / {tot/3600:.2f}h")
+
+    # Finish modal-like section
+    if st.session_state.get("finish_open"):
+        tid = st.session_state.get("finish_target")
+        t = find_task(day, tid) if tid else None
+        if t:
+            st.divider()
+            st.subheader("区切る / 完了（確認）")
+            st.caption("目標時間より早い場合も、責めないための確認だけします。")
+
+            est = safe_int(t.get("est_min", 0), 0) * 60
+            elapsed = current_elapsed_for_task(t["id"])
+            # If running, record it upon decision
+            # We'll record elapsed to sessions when we "確定" below
+
+            early = elapsed < est and elapsed > 0
+
+            if early:
+                st.info("予定より早く区切っています。状態を選んでください（責めないための確認です）。")
+
+            k_state = f"early_state_{t['id']}"
+            if k_state not in st.session_state:
+                st.session_state[k_state] = "done" if not early else "done"
+
+            if early:
+                early_state = st.radio(
+                    "どの状態に近い？",
+                    options=["done", "cut_ok", "cut_forced"],
+                    format_func=lambda x: {
+                        "done": "想定よりスムーズに終わった（完了）",
+                        "cut_ok": "区切りが良いので止めた（区切り）",
+                        "cut_forced": "やむを得ず止めた（区切り）",
+                    }[x],
+                    key=k_state,
+                )
+            else:
+                early_state = "done"
+
+            k_note = f"finish_note_{t['id']}"
+            if k_note not in st.session_state:
+                st.session_state[k_note] = ""
+
+            note = st.text_area("一言だけ（明日の自分が助かるメモ）", key=k_note, height=70, placeholder="例：次は図の軸だけ決める / 要旨は背景から書く")
+
+            c1, c2, c3 = st.columns([1, 1, 2])
+            with c1:
+                if st.button("キャンセル", use_container_width=True):
+                    st.session_state["finish_open"] = False
+                    st.session_state["finish_target"] = None
+                    st.rerun()
+            with c2:
+                if st.button("確定", use_container_width=True):
+                    # Record time session
+                    stop_timer_and_record_session(day, t["id"])
+
+                    # Update status
+                    if early and early_state in ("cut_ok", "cut_forced"):
+                        t["status"] = "cut"
+                        t["ended_early"] = {
+                            "reason": early_state,
+                            "elapsed_sec": elapsed,
+                            "est_sec": est,
+                            "note": note.strip(),
+                            "at": now_local().isoformat(timespec="seconds"),
+                        }
+                    else:
+                        t["status"] = "done"
+                        if early:
+                            t["ended_early"] = {
+                                "reason": "done",
+                                "elapsed_sec": elapsed,
+                                "est_sec": est,
+                                "note": note.strip(),
+                                "at": now_local().isoformat(timespec="seconds"),
+                            }
+                    t["done_note"] = note.strip()
+                    update_task(day, t)
+                    save_day(day)
+
+                    st.session_state["finish_open"] = False
+                    st.session_state["finish_target"] = None
+                    push_toast("記録しました。")
+                    st.rerun()
+            with c3:
+                st.caption(f"稼働: {format_hms(elapsed)} / 目安: {format_hms(est)}")
+
+    # "今日を終える" shortcut (must route to mode)
+    st.divider()
+    if st.button("今日を終えるへ", use_container_width=True):
+        st.session_state["mode"] = "今日を終える"
+        st.rerun()
+
+    return day
+
+
+# =========================================================
+# Close Day Page: "今日を終える"
+# =========================================================
+
+
+def close_day_page(day: Dict[str, Any], goals_data: Dict[str, Any], ref: date) -> Dict[str, Any]:
+    st.header("今日を終える")
+    st.caption("否定しません。事実を残して、明日の最小の一歩を決めます。")
+
+    tasks = [ensure_task_shape(t) for t in day.get("tasks", [])]
+    day["tasks"] = tasks
+
+    if not tasks:
+        st.info("今日のタスクがありません。必要なら「今日することをまとめる」から作れます。")
+        return day
+
+    # Snapshot
+    done = sum(1 for t in tasks if t.get("status") == "done")
+    cut = sum(1 for t in tasks if t.get("status") == "cut")
+    total = len(tasks)
+    total_sec = sum(safe_int(t.get("time", {}).get("total_sec", 0), 0) for t in tasks)
+
+    st.subheader("今日のふりかえり（短く）")
+    st.write(f"- 完了: {done}/{total} / 区切り: {cut}")
+    st.write(f"- 合計稼働: {total_sec/3600:.2f}h")
+
+    # Feeling (simple)
+    if "feeling" not in st.session_state:
+        st.session_state["feeling"] = "手応えあり"
+    feeling = st.selectbox("手応え", options=["手応えあり", "少し進んだ", "今日は難しかった"], key="feeling")
+
+    # Gentle summary (auto)
+    summary = {
+        "手応えあり": "今日の記録、しっかり積み上がっています。",
+        "少し進んだ": "少しでも前に進めたのは大きいです。記録が残っているのが強いです。",
+        "今日は難しかった": "難しい日でも、ここまで来て記録できたことが価値です。",
+    }[feeling]
+    st.success(summary)
+
+    # Link to goals/milestones: show contributions for today
+    gmap = goal_lookup(goals_data)
+    mmap = milestone_lookup(goals_data)
+
+    contrib_goal: Dict[str, int] = {}
+    contrib_ms: Dict[str, int] = {}
+    for t in tasks:
+        sec = safe_int(t.get("time", {}).get("total_sec", 0), 0)
+        gid = (t.get("goal_id") or "").strip()
+        mid = (t.get("milestone_id") or "").strip()
+        if gid:
+            contrib_goal[gid] = contrib_goal.get(gid, 0) + sec
+        if mid:
+            contrib_ms[mid] = contrib_ms.get(mid, 0) + sec
+
+    if contrib_goal or contrib_ms:
+        st.subheader("目標/マイルストーンへの貢献")
+        if contrib_goal:
+            for gid, sec in sorted(contrib_goal.items(), key=lambda x: x[1], reverse=True):
+                g = gmap.get(gid, {})
+                st.write(f"- {g.get('title','（無題）')}: {sec/3600:.2f}h")
+        if contrib_ms:
+            # map milestone to goal title
+            ms_to_goal: Dict[str, str] = {}
+            for g in goals_data.get("goals", []):
+                gt = (g.get("title") or "（無題）").strip()
+                for m in g.get("milestones", []):
+                    ms_to_goal[m.get("id", "")] = gt
+            for mid, sec in sorted(contrib_ms.items(), key=lambda x: x[1], reverse=True):
+                m = mmap.get(mid, {})
+                st.write(f"- {ms_to_goal.get(mid,'（目標不明）')} / {m.get('title','（無題）')}: {sec/3600:.2f}h")
+
+    st.divider()
+
+    # Next tiny step: propose 3 options
+    st.subheader("明日の最小の一歩（1つだけ）")
+    # Proposals: based on nearest milestone, plus generic
+    nm = next_upcoming_milestone(goals_data, ref + timedelta(days=1))
+    proposals: List[str] = []
+    if nm:
+        g, m = nm
+        gt = (g.get("title") or "").strip()
+        mt = (m.get("title") or "").strip()
+        md = (m.get("deliverable") or "").strip()
+        if md:
+            proposals.append(f"{gt} / {mt}: 成果物に向けて「最初の一手」だけ決める（{md[:30]}…）")
+        else:
+            proposals.append(f"{gt} / {mt}: まず5分だけ手をつける（最初の一手）")
+    proposals.extend(
+        [
+            "今日の続きの“区切り”から再開する（1ステップだけ）",
+            "明日のタスクを1つだけ短く書いて終える",
+        ]
+    )
+    proposals = proposals[:3]
+
+    if "next_step_choice" not in st.session_state:
+        st.session_state["next_step_choice"] = proposals[0] if proposals else ""
+    choice = st.radio("選ぶだけでOK", options=proposals, key="next_step_choice")
+    # Optional note
+    if "next_step_note" not in st.session_state:
+        st.session_state["next_step_note"] = ""
+    note = st.text_input("補足（任意）", key="next_step_note", placeholder="例：図1の軸だけ / 要旨は背景だけ")
+
+    st.divider()
+    st.subheader("今日を保存して終える")
+
+    # Ensure we don't lose tasks added after first close
+    # Policy: "close" re-saves current day snapshot always.
+    if st.button("今日を終える（保存）", use_container_width=True):
+        # If any running timer exists, pause and record? We choose: pause but do not auto-finish.
+        running = _get_running_task_id()
+        if running:
+            pause_timer(day, running)
+
+        day["closed"] = True
+        day["closed_at"] = now_local().isoformat(timespec="seconds")
+        day.setdefault("reflection", {})
+        day["reflection"].update(
+            {
+                "feeling": feeling,
+                "summary": summary,
+                "next_step": choice,
+                "next_step_note": (note or "").strip(),
+                "saved_at": now_local().isoformat(timespec="seconds"),
+            }
+        )
+        save_day(day)
+        push_toast("今日を保存しました。おつかれさまでした。")
+        st.rerun()
+
+    return day
+
+
+# =========================================================
+# Navigation / Mode selector
+# =========================================================
+
+
+def top_nav() -> None:
+    st.title(APP_TITLE)
+    # Order requested: 今日することをまとめる → 今日 → 今日を終える
+    modes = ["今日することをまとめる", "今日", "今日を終える", "遠い目標（β）"]
+    cur = st.session_state.get("mode", modes[0])
+    try:
+        idx = modes.index(cur)
+    except ValueError:
+        idx = 0
+
+    chosen = st.radio(
+        "画面",
+        options=modes,
+        index=idx,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.session_state["mode"] = chosen
+
+
+# =========================================================
+# Main App
+# =========================================================
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    init_session_defaults()
+    ensure_dirs()
+
+    # Load data
+    rollover_hour = st.session_state.get("rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR)
+    ref = today_research_date(rollover_hour)
+    day = load_day(ref)
+    goals_data = load_goals()
+
+    # Sidebar
+    sidebar_snapshot(day, goals_data)
+    sidebar_next_milestone(goals_data, ref)
+    sidebar_dashboard(day, ref)
+    sidebar_report(goals_data, ref, rollover_hour)
+
+    st.sidebar.divider()
+
+    # Rollover hour setting (advanced)
+    with st.sidebar.expander("日付変更時間の設定", expanded=False):
+        st.caption("日付の区切りを調整できます（深夜作業対策）。")
+        if "rollover_hour_widget" not in st.session_state:
+            st.session_state["rollover_hour_widget"] = rollover_hour
+        rh = st.number_input("研究日の区切り（時）", min_value=0, max_value=8, step=1, key="rollover_hour_widget")
+        if st.button("適用", key="apply_rollover", use_container_width=True):
+            st.session_state["rollover_hour"] = int(rh)
+            push_toast("区切り設定を適用しました。")
+            st.rerun()
+
+        # Goals quick view
+    with st.sidebar.expander("目標一覧（詳細）", expanded=False):
+        sidebar_goals(goals_data)
+
+        # --- 追記：目標の作成日時一覧（関数sidebar_goalsを触らずに追加する版） ---
+        goals = goals_data.get("goals", [])
+        rows = []
+        for g in goals:
+            created_at = (g.get("created_at") or "").strip()
+            if created_at:
+                title = (g.get("title") or "（無題）").strip()
+                rows.append((title, created_at.replace("T", " ")))
+
+        if rows:
+            st.divider()
+            st.caption("作成日時（目標を追加した時刻）")
+            for title, created_at in rows:
+                st.caption(f"・{title} — {created_at}")
+
+
+    if rows:
+        st.divider()
+        st.caption("作成日時（目標を追加した時刻）")
+        for title, created_at in rows:
+            st.caption(f"・{title} — {created_at}")
+
+        
+
+    # Top nav
+    top_nav()
+
+    # Route
+    mode = st.session_state.get("mode", "今日することをまとめる")
+
+    if mode == "今日することをまとめる":
+        day = planning_page(day, goals_data, ref)
+    elif mode == "今日":
+        day = today_page(day, goals_data, ref)
+    elif mode == "今日を終える":
+        day = close_day_page(day, goals_data, ref)
+    elif mode == "遠い目標（β）":
+        goals_data = goals_editor(goals_data)
+        # Save after edits already in editor; but keep safe.
+        save_goals(goals_data)
+    else:
+        st.write("Unknown mode")
+
+    # Persist day at end (safe, additive)
+    save_day(day)
+
+
+if __name__ == "__main__":
+    main()

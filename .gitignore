@@ -1,0 +1,16 @@
+# virtual env
+.venv/
+
+# local data (logs)
+data/
+*.json
+
+# python cache
+__pycache__/
+*.pyc
+
+# mac
+.DS_Store
+
+# optional
+.env
